@@ -1,0 +1,26 @@
+        # fly.toml app configuration file for your application
+
+        # IMPORTANT: This must match the new app name you just created on Fly.io
+        app = "ariaka-signal-final"
+        primary_region = "jnb" # Or whichever region you chose
+
+        # An empty build section tells Fly.io to use your Dockerfile
+        [build]
+
+        # The [[services]] block gives us more control over ports and health checks.
+        [[services]]
+          internal_port = 8080
+          protocol = "tcp"
+
+          # This section defines how Fly.io checks if your app is healthy.
+          [[services.tcp_checks]]
+            interval = "15s"       # How often to check
+            timeout = "2s"         # How long to wait for a response
+            grace_period = "20s"   # How long to wait after startup before the first check
+
+        # This section defines the size of the machine to run the server on.
+        [[vm]]
+          memory = '1gb'
+          cpu_kind = 'shared'
+          cpus = 1
+        
