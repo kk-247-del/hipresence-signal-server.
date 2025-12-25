@@ -4,7 +4,22 @@ import http from 'http';
 import https from 'https';
 import cors from 'cors';
 
+/* =========================
+   CONFIG
+   ========================= */
+
 const PORT = process.env.PORT || 8080;
+
+// Safety limits
+const MAX_PEERS_PER_ROOM = 6;
+const HEARTBEAT_INTERVAL = 15000; // 15s
+const STALE_AFTER = 30000;        // 30s
+const MAX_MSGS_PER_WINDOW = 60;
+const RATE_WINDOW_MS = 10000;
+
+/* =========================
+   SERVER SETUP
+   ========================= */
 
 const app = express();
 const server = http.createServer(app);
@@ -14,102 +29,151 @@ app.use(cors());
 
 /**
  * rooms: Map<roomId, Set<WebSocket>>
+ * sockets: WeakMap<WebSocket, Meta>
  */
 const rooms = new Map();
+const sockets = new WeakMap();
 
 /* =========================
-   WEBSOCKET SIGNALLING
+   HELPERS
+   ========================= */
+
+const now = () => Date.now();
+
+const send = (ws, obj) => {
+  if (ws.readyState === 1) {
+    ws.send(JSON.stringify(obj));
+  }
+};
+
+const broadcast = (room, sender, obj) => {
+  const peers = rooms.get(room);
+  if (!peers) return;
+  for (const peer of peers) {
+    if (peer !== sender) send(peer, obj);
+  }
+};
+
+const removePeer = (ws) => {
+  const meta = sockets.get(ws);
+  if (!meta || !meta.room) return;
+
+  const { room } = meta;
+  const peers = rooms.get(room);
+  if (!peers) return;
+
+  peers.delete(ws);
+  sockets.delete(ws);
+
+  broadcast(room, ws, { type: 'peer-left' });
+
+  if (peers.size === 0) {
+    rooms.delete(room);
+  }
+};
+
+/* =========================
+   HEARTBEAT
+   ========================= */
+
+const heartbeat = setInterval(() => {
+  const time = now();
+
+  for (const ws of sockets.keys()) {
+    const meta = sockets.get(ws);
+    if (!meta) continue;
+
+    if (time - meta.lastSeen > STALE_AFTER) {
+      try {
+        ws.terminate();
+      } catch {}
+      removePeer(ws);
+      continue;
+    }
+
+    try {
+      ws.ping();
+    } catch {}
+  }
+}, HEARTBEAT_INTERVAL);
+
+/* =========================
+   WEBSOCKET HANDLING
    ========================= */
 
 wss.on('connection', (ws) => {
-  let joinedRoom = null;
+  sockets.set(ws, {
+    room: null,
+    lastSeen: now(),
+    rateCount: 0,
+    rateReset: now() + RATE_WINDOW_MS,
+  });
 
-  const send = (socket, obj) => {
-    if (socket.readyState === 1) {
-      socket.send(JSON.stringify(obj));
-    }
-  };
+  ws.on('pong', () => {
+    const meta = sockets.get(ws);
+    if (meta) meta.lastSeen = now();
+  });
 
-  const broadcast = (room, sender, obj) => {
-    const peers = rooms.get(room);
-    if (!peers) return;
-    for (const peer of peers) {
-      if (peer !== sender) {
-        send(peer, obj);
-      }
-    }
-  };
+  ws.on('message', (raw) => {
+    const meta = sockets.get(ws);
+    if (!meta) return;
 
-  const handleSignalingMessage = (data) => {
-    const { type, room, payload } = data;
-    if (!type || !room) return;
-
-    /* ───── JOIN ───── */
-    if (type === 'join') {
-      if (!rooms.has(room)) {
-        rooms.set(room, new Set());
-      }
-
-      const peers = rooms.get(room);
-      peers.add(ws);
-      joinedRoom = room;
-
-      console.log(`[WS] Peer joined room ${room}. Count=${peers.size}`);
-
-      // Inform existing peers that someone is present
-      broadcast(room, ws, { type: 'peer-present' });
-
-      // Inform the new peer that others (if any) are present
-      if (peers.size > 1) {
-        send(ws, { type: 'peer-present' });
-      }
-
-      return;
+    /* ───── RATE LIMIT ───── */
+    const t = now();
+    if (t > meta.rateReset) {
+      meta.rateCount = 0;
+      meta.rateReset = t + RATE_WINDOW_MS;
     }
 
-    /* ───── RELAY ALL OTHER SIGNALING ───── */
-    broadcast(room, ws, { type, payload });
-  };
+    meta.rateCount++;
+    if (meta.rateCount > MAX_MSGS_PER_WINDOW) return;
 
-  const handleRawData = (message) => {
-    if (!joinedRoom) return;
-    const peers = rooms.get(joinedRoom);
-    if (!peers) return;
+    meta.lastSeen = t;
 
-    for (const peer of peers) {
-      if (peer !== ws && peer.readyState === 1) {
-        peer.send(message);
-      }
-    }
-  };
+    const text = raw.toString();
 
-  ws.on('message', (rawMessage) => {
-    const text = rawMessage.toString();
+    /* ───── JSON SIGNALING ───── */
     try {
-      const json = JSON.parse(text);
-      handleSignalingMessage(json);
+      const data = JSON.parse(text);
+      const { type, room, payload } = data;
+      if (!type || !room) return;
+
+      /* JOIN */
+      if (type === 'join') {
+        if (!rooms.has(room)) rooms.set(room, new Set());
+        const peers = rooms.get(room);
+
+        if (peers.size >= MAX_PEERS_PER_ROOM) return;
+
+        peers.add(ws);
+        meta.room = room;
+
+        // Inform presence
+        broadcast(room, ws, { type: 'peer-present' });
+        if (peers.size > 1) send(ws, { type: 'peer-present' });
+
+        return;
+      }
+
+      /* RELAY */
+      broadcast(room, ws, { type, payload });
+      return;
     } catch {
-      handleRawData(text);
+      /* ───── RAW DATA (LIVE TEXT) ───── */
+      if (!meta.room) return;
+      const peers = rooms.get(meta.room);
+      if (!peers) return;
+
+      for (const peer of peers) {
+        if (peer !== ws && peer.readyState === 1) {
+          peer.send(text);
+        }
+      }
     }
   });
 
-  ws.on('close', () => {
-    if (!joinedRoom) return;
-
-    const peers = rooms.get(joinedRoom);
-    if (!peers) return;
-
-    peers.delete(ws);
-    console.log(`[WS] Peer left room ${joinedRoom}. Remaining=${peers.size}`);
-
-    // Notify remaining peers that presence degraded
-    broadcast(joinedRoom, ws, { type: 'peer-left' });
-
-    if (peers.size === 0) {
-      rooms.delete(joinedRoom);
-      console.log(`[WS] Room ${joinedRoom} deleted`);
-    }
-  });
+  ws.on('close', () => removePeer(ws));
+  ws.on('error', () => removePeer(ws));
 });
 
 /* =========================
@@ -121,7 +185,6 @@ app.get('/turn', (req, res) => {
   const METERED_API_KEY = process.env.METERED_API_KEY;
 
   if (!METERED_API_KEY) {
-    console.error('METERED_API_KEY not set');
     return res.status(500).send('Server misconfigured');
   }
 
@@ -141,8 +204,7 @@ app.get('/turn', (req, res) => {
     });
   });
 
-  apiReq.on('error', (err) => {
-    console.error('Metered error:', err);
+  apiReq.on('error', () => {
     res.status(500).send('TURN fetch failed');
   });
 
@@ -150,9 +212,22 @@ app.get('/turn', (req, res) => {
 });
 
 /* =========================
-   START SERVER
+   START
    ========================= */
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Hi Presence signaling server running on ${PORT}`);
 });
+
+/* =========================
+   OPTIONAL: REDIS SCALING
+   ========================= */
+/*
+If you want horizontal scaling later:
+
+- Use Redis pub/sub
+- Replace rooms Map with Redis-backed room registry
+- Broadcast via pub/sub instead of local Set
+
+This server is already compatible with that model.
+*/
