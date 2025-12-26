@@ -10,10 +10,9 @@ import cors from 'cors';
 
 const PORT = process.env.PORT || 8080;
 
-// Safety limits
 const MAX_PEERS_PER_ROOM = 6;
-const HEARTBEAT_INTERVAL = 15000; // 15s
-const STALE_AFTER = 30000;        // 30s
+const HEARTBEAT_INTERVAL = 15000;
+const STALE_AFTER = 30000;
 const MAX_MSGS_PER_WINDOW = 60;
 const RATE_WINDOW_MS = 10000;
 
@@ -38,7 +37,8 @@ app.use(cors());
  *   room: string | null,
  *   lastSeen: number,
  *   rateCount: number,
- *   rateReset: number
+ *   rateReset: number,
+ *   joined: boolean
  * }>
  */
 const rooms = new Map();
@@ -59,16 +59,29 @@ const send = (ws, obj) => {
 const broadcast = (roomId, sender, obj) => {
   const room = rooms.get(roomId);
   if (!room) return;
+
   for (const peer of room.peers) {
-    if (peer !== sender) send(peer, obj);
+    if (peer !== sender && peer.readyState === peer.OPEN) {
+      send(peer, obj);
+    }
   }
+};
+
+const drop = (ws, reason) => {
+  try {
+    send(ws, { type: 'error', reason });
+  } catch {}
+  try {
+    ws.terminate();
+  } catch {}
+  removePeer(ws);
 };
 
 const removePeer = (ws) => {
   const meta = sockets.get(ws);
   if (!meta) return;
 
-  const { room: roomId } = meta;
+  const roomId = meta.room;
   sockets.delete(ws);
 
   if (!roomId) return;
@@ -80,7 +93,6 @@ const removePeer = (ws) => {
 
   broadcast(roomId, ws, { type: 'peer-left' });
 
-  // Reset readiness if quorum broken
   if (room.ready && room.peers.size < room.quorum) {
     room.ready = false;
     broadcast(roomId, null, { type: 'moment-collapsed' });
@@ -100,16 +112,12 @@ setInterval(() => {
 
   for (const [ws, meta] of sockets.entries()) {
     if (time - meta.lastSeen > STALE_AFTER) {
-      try {
-        ws.terminate();
-      } catch {}
+      try { ws.terminate(); } catch {}
       removePeer(ws);
       continue;
     }
 
-    try {
-      ws.ping();
-    } catch {}
+    try { ws.ping(); } catch {}
   }
 }, HEARTBEAT_INTERVAL);
 
@@ -123,6 +131,7 @@ wss.on('connection', (ws) => {
     lastSeen: now(),
     rateCount: 0,
     rateReset: now() + RATE_WINDOW_MS,
+    joined: false,
   });
 
   ws.on('pong', () => {
@@ -134,94 +143,82 @@ wss.on('connection', (ws) => {
     const meta = sockets.get(ws);
     if (!meta) return;
 
-    /* ───── RATE LIMIT ───── */
     const t = now();
+    meta.lastSeen = t;
+
+    // Rate limiting
     if (t > meta.rateReset) {
       meta.rateCount = 0;
       meta.rateReset = t + RATE_WINDOW_MS;
     }
-
-    meta.rateCount++;
-    if (meta.rateCount > MAX_MSGS_PER_WINDOW) return;
-
-    meta.lastSeen = t;
-
-    const text = raw.toString();
-
-    /* ───── JSON SIGNALING ───── */
-    try {
-      const data = JSON.parse(text);
-      const { type, room, payload } = data;
-      if (!type || !room) return;
-
-      /* JOIN ROOM */
-      if (type === 'join') {
-        const quorum =
-          typeof payload?.quorum === 'number'
-            ? payload.quorum
-            : 2;
-
-        if (!rooms.has(room)) {
-          rooms.set(room, {
-            peers: new Set(),
-            quorum,
-            ready: false,
-          });
-        }
-
-        const roomState = rooms.get(room);
-
-        if (roomState.peers.size >= MAX_PEERS_PER_ROOM) return;
-
-        roomState.peers.add(ws);
-        meta.room = room;
-
-        // Notify presence
-        broadcast(room, ws, { type: 'peer-present' });
-        if (roomState.peers.size > 1) {
-          send(ws, { type: 'peer-present' });
-        }
-
-        // Check quorum
-        if (
-          !roomState.ready &&
-          roomState.peers.size >= roomState.quorum
-        ) {
-          roomState.ready = true;
-          for (const peer of roomState.peers) {
-            send(peer, { type: 'moment-ready' });
-          }
-        }
-
-        return;
-      }
-
-      /* MEDIA / SDP / ICE RELAY */
-      if (
-        type === 'offer' ||
-        type === 'answer' ||
-        type === 'candidate' ||
-        type === 'renegotiate'
-      ) {
-        broadcast(room, ws, { type, payload });
-        return;
-      }
-
-      /* GENERIC RELAY */
-      broadcast(room, ws, { type, payload });
-      return;
-    } catch {
-      /* ───── RAW DATA (LIVE TEXT) ───── */
-      if (!meta.room) return;
-      const roomState = rooms.get(meta.room);
-      if (!roomState) return;
-
-      for (const peer of roomState.peers) {
-        if (peer !== ws && peer.readyState === ws.OPEN) {
-          peer.send(text);
-        }
-      }
+    if (++meta.rateCount > MAX_MSGS_PER_WINDOW) {
+      return drop(ws, 'rate-limit');
     }
+
+    let data;
+    try {
+      data = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+
+    let { type, room, payload } = data;
+    if (!type || !room) {
+      return drop(ws, 'invalid-envelope');
+    }
+
+    // Normalize ICE naming
+    if (type === 'ice') type = 'candidate';
+
+    /* ───── JOIN ───── */
+    if (type === 'join') {
+      if (meta.joined) return;
+
+      const quorum =
+        typeof payload?.quorum === 'number'
+          ? payload.quorum
+          : 2;
+
+      if (!rooms.has(room)) {
+        rooms.set(room, {
+          peers: new Set(),
+          quorum,
+          ready: false,
+        });
+      }
+
+      const roomState = rooms.get(room);
+
+      if (roomState.peers.size >= MAX_PEERS_PER_ROOM) {
+        return drop(ws, 'room-full');
+      }
+
+      meta.room = room;
+      meta.joined = true;
+      roomState.peers.add(ws);
+
+      broadcast(room, ws, { type: 'peer-present' });
+      if (roomState.peers.size > 1) {
+        send(ws, { type: 'peer-present' });
+      }
+
+      if (!roomState.ready && roomState.peers.size >= roomState.quorum) {
+        roomState.ready = true;
+        for (const peer of roomState.peers) {
+          send(peer, { type: 'moment-ready' });
+        }
+      }
+
+      return;
+    }
+
+    /* ───── ENFORCE JOIN FIRST ───── */
+    if (!meta.joined) {
+      return drop(ws, 'join-required');
+    }
+
+    /* ───── SIGNAL RELAY ───── */
+    broadcast(room, ws, { type, payload });
   });
 
   ws.on('close', () => removePeer(ws));
