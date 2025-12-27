@@ -91,11 +91,11 @@ const removePeer = (ws) => {
 
   room.peers.delete(ws);
 
-  broadcast(roomId, ws, { type: 'peer-left' });
+  broadcast(roomId, ws, { type: 'peer-left', room: roomId });
 
   if (room.ready && room.peers.size < room.quorum) {
     room.ready = false;
-    broadcast(roomId, null, { type: 'moment-collapsed' });
+    broadcast(roomId, null, { type: 'moment-collapsed', room: roomId });
   }
 
   if (room.peers.size === 0) {
@@ -197,15 +197,15 @@ wss.on('connection', (ws) => {
       meta.joined = true;
       roomState.peers.add(ws);
 
-      broadcast(room, ws, { type: 'peer-present' });
+      broadcast(room, ws, { type: 'peer-present', room });
       if (roomState.peers.size > 1) {
-        send(ws, { type: 'peer-present' });
+        send(ws, { type: 'peer-present', room });
       }
 
       if (!roomState.ready && roomState.peers.size >= roomState.quorum) {
         roomState.ready = true;
         for (const peer of roomState.peers) {
-          send(peer, { type: 'moment-ready' });
+          send(peer, { type: 'moment-ready', room });
         }
       }
 
@@ -217,8 +217,12 @@ wss.on('connection', (ws) => {
       return drop(ws, 'join-required');
     }
 
-    /* ───── SIGNAL RELAY ───── */
-    broadcast(room, ws, { type, payload });
+    /* ───── SIGNAL RELAY (FIXED) ───── */
+    broadcast(room, ws, {
+      type,
+      room,      // ✅ CRITICAL FIX
+      payload,
+    });
   });
 
   ws.on('close', () => removePeer(ws));
