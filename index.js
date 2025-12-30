@@ -4,21 +4,11 @@ import http from 'http';
 import https from 'https';
 import cors from 'cors';
 
-/* =========================
-   CONFIG
-   ========================= */
-
 const PORT = process.env.PORT || 8080;
 
 const MAX_PEERS_PER_ROOM = 6;
 const HEARTBEAT_INTERVAL = 15000;
 const STALE_AFTER = 30000;
-const MAX_MSGS_PER_WINDOW = 60;
-const RATE_WINDOW_MS = 10000;
-
-/* =========================
-   SERVER SETUP
-   ========================= */
 
 const app = express();
 const server = http.createServer(app);
@@ -30,23 +20,20 @@ app.use(cors());
  * rooms: Map<roomId, {
  *   peers: Set<WebSocket>,
  *   quorum: number,
- *   ready: boolean
- * }>
- *
- * sockets: Map<WebSocket, {
- *   room: string | null,
- *   lastSeen: number,
- *   rateCount: number,
- *   rateReset: number,
- *   joined: boolean
+ *   ready: boolean,
+ *   signalBuffer: Array<{ sender, msg }>
  * }>
  */
 const rooms = new Map();
-const sockets = new Map();
 
-/* =========================
-   HELPERS
-   ========================= */
+/**
+ * sockets: Map<WebSocket, {
+ *   room: string | null,
+ *   lastSeen: number,
+ *   joined: boolean
+ * }>
+ */
+const sockets = new Map();
 
 const now = () => Date.now();
 
@@ -67,16 +54,6 @@ const broadcast = (roomId, sender, obj) => {
   }
 };
 
-const drop = (ws, reason) => {
-  try {
-    send(ws, { type: 'error', reason });
-  } catch {}
-  try {
-    ws.terminate();
-  } catch {}
-  removePeer(ws);
-};
-
 const removePeer = (ws) => {
   const meta = sockets.get(ws);
   if (!meta) return;
@@ -85,7 +62,6 @@ const removePeer = (ws) => {
   sockets.delete(ws);
 
   if (!roomId) return;
-
   const room = rooms.get(roomId);
   if (!room) return;
 
@@ -93,44 +69,31 @@ const removePeer = (ws) => {
 
   broadcast(roomId, ws, { type: 'peer-left', room: roomId });
 
-  if (room.ready && room.peers.size < room.quorum) {
-    room.ready = false;
-    broadcast(roomId, null, { type: 'moment-collapsed', room: roomId });
-  }
-
   if (room.peers.size === 0) {
     rooms.delete(roomId);
   }
 };
 
-/* =========================
-   HEARTBEAT
-   ========================= */
+/* ───────── HEARTBEAT ───────── */
 
 setInterval(() => {
-  const time = now();
-
-  for (const [ws, meta] of sockets.entries()) {
-    if (time - meta.lastSeen > STALE_AFTER) {
+  const t = now();
+  for (const [ws, meta] of sockets) {
+    if (t - meta.lastSeen > STALE_AFTER) {
       try { ws.terminate(); } catch {}
       removePeer(ws);
-      continue;
+    } else {
+      try { ws.ping(); } catch {}
     }
-
-    try { ws.ping(); } catch {}
   }
 }, HEARTBEAT_INTERVAL);
 
-/* =========================
-   WEBSOCKET HANDLING
-   ========================= */
+/* ───────── WS ───────── */
 
 wss.on('connection', (ws) => {
   sockets.set(ws, {
     room: null,
     lastSeen: now(),
-    rateCount: 0,
-    rateReset: now() + RATE_WINDOW_MS,
     joined: false,
   });
 
@@ -143,17 +106,7 @@ wss.on('connection', (ws) => {
     const meta = sockets.get(ws);
     if (!meta) return;
 
-    const t = now();
-    meta.lastSeen = t;
-
-    // Rate limiting
-    if (t > meta.rateReset) {
-      meta.rateCount = 0;
-      meta.rateReset = t + RATE_WINDOW_MS;
-    }
-    if (++meta.rateCount > MAX_MSGS_PER_WINDOW) {
-      return drop(ws, 'rate-limit');
-    }
+    meta.lastSeen = now();
 
     let data;
     try {
@@ -163,45 +116,44 @@ wss.on('connection', (ws) => {
     }
 
     let { type, room, payload } = data;
-    if (!type || !room) {
-      return drop(ws, 'invalid-envelope');
-    }
+    if (!type || !room) return;
 
-    // Normalize ICE naming
     if (type === 'ice') type = 'candidate';
 
     /* ───── JOIN ───── */
     if (type === 'join') {
       if (meta.joined) return;
 
-      const quorum =
-        typeof payload?.quorum === 'number'
-          ? payload.quorum
-          : 2;
+      const quorum = typeof payload?.quorum === 'number' ? payload.quorum : 2;
 
       if (!rooms.has(room)) {
         rooms.set(room, {
           peers: new Set(),
           quorum,
           ready: false,
+          signalBuffer: [],
         });
       }
 
       const roomState = rooms.get(room);
-
-      if (roomState.peers.size >= MAX_PEERS_PER_ROOM) {
-        return drop(ws, 'room-full');
-      }
+      if (roomState.peers.size >= MAX_PEERS_PER_ROOM) return;
 
       meta.room = room;
       meta.joined = true;
       roomState.peers.add(ws);
 
       broadcast(room, ws, { type: 'peer-present', room });
-      if (roomState.peers.size > 1) {
-        send(ws, { type: 'peer-present', room });
+      send(ws, { type: 'peer-present', room });
+
+      // Flush buffered SDP
+      if (roomState.peers.size > 1 && roomState.signalBuffer.length) {
+        for (const { sender, msg } of roomState.signalBuffer) {
+          broadcast(room, sender, msg);
+        }
+        roomState.signalBuffer = [];
       }
 
+      // Presence-only readiness (optional UI signal)
       if (!roomState.ready && roomState.peers.size >= roomState.quorum) {
         roomState.ready = true;
         for (const peer of roomState.peers) {
@@ -212,61 +164,53 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    /* ───── ENFORCE JOIN FIRST ───── */
-    if (!meta.joined) {
-      return drop(ws, 'join-required');
+    /* ───── REQUIRE JOIN ───── */
+    if (!meta.joined) return;
+
+    const roomState = rooms.get(room);
+    if (!roomState) return;
+
+    const msg = { type, room, payload };
+
+    /* ───── SDP / ICE RELAY ───── */
+    if (type === 'offer' || type === 'answer' || type === 'candidate') {
+      if (roomState.peers.size < 2) {
+        roomState.signalBuffer.push({ sender: ws, msg });
+      } else {
+        broadcast(room, ws, msg);
+      }
+      return;
     }
 
-    /* ───── SIGNAL RELAY (FIXED) ───── */
-    broadcast(room, ws, {
-      type,
-      room,      // ✅ CRITICAL FIX
-      payload,
-    });
+    /* ───── OTHER CONTROL MESSAGES ───── */
+    broadcast(room, ws, msg);
   });
 
   ws.on('close', () => removePeer(ws));
   ws.on('error', () => removePeer(ws));
 });
 
-/* =========================
-   TURN CREDENTIALS
-   ========================= */
+/* ───────── TURN ───────── */
 
 app.get('/turn', (req, res) => {
-  const METERED_DOMAIN = 'hi-presence.metered.live';
-  const METERED_API_KEY = process.env.METERED_API_KEY;
+  const DOMAIN = 'hi-presence.metered.live';
+  const KEY = process.env.METERED_API_KEY;
+  if (!KEY) return res.status(500).send('TURN not configured');
 
-  if (!METERED_API_KEY) {
-    return res.status(500).send('Server misconfigured');
-  }
-
-  const options = {
-    hostname: METERED_DOMAIN,
-    path: `/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`,
-    method: 'GET',
-    headers: { 'Content-Type': 'application/json' },
-  };
-
-  const apiReq = https.request(options, (apiRes) => {
-    let data = '';
-    apiRes.on('data', (c) => (data += c));
-    apiRes.on('end', () => {
-      res.setHeader('Content-Type', 'application/json');
-      res.send(data);
-    });
-  });
-
-  apiReq.on('error', () => {
-    res.status(500).send('TURN fetch failed');
-  });
-
-  apiReq.end();
+  https.get(
+    `https://${DOMAIN}/api/v1/turn/credentials?apiKey=${KEY}`,
+    (r) => {
+      let d = '';
+      r.on('data', (c) => (d += c));
+      r.on('end', () => {
+        res.setHeader('Content-Type', 'application/json');
+        res.send(d);
+      });
+    },
+  ).on('error', () => res.status(500).send('TURN failed'));
 });
 
-/* =========================
-   START
-   ========================= */
+/* ───────── START ───────── */
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Hi Presence signaling server running on ${PORT}`);
