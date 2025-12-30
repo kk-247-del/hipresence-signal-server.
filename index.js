@@ -3,15 +3,7 @@ import express from 'express';
 import http from 'http';
 import cors from 'cors';
 
-/* =========================
-   CONFIG (RELAXED TEST MODE)
-   ========================= */
-
 const PORT = process.env.PORT || 8080;
-
-/* =========================
-   SERVER SETUP
-   ========================= */
 
 const app = express();
 const server = http.createServer(app);
@@ -20,13 +12,13 @@ const wss = new WebSocketServer({ server });
 app.use(cors());
 
 /**
- * rooms: Map<roomId, Set<WebSocket>>
+ * rooms: Map<roomId, {
+ *   peers: Set<WebSocket>,
+ *   lastOffer: object | null,
+ *   lastAnswer: object | null
+ * }>
  */
 const rooms = new Map();
-
-/* =========================
-   HELPERS
-   ========================= */
 
 const send = (ws, obj) => {
   if (ws.readyState === ws.OPEN) {
@@ -35,22 +27,18 @@ const send = (ws, obj) => {
 };
 
 const broadcastExceptSender = (roomId, sender, obj) => {
-  const peers = rooms.get(roomId);
-  if (!peers) return;
+  const room = rooms.get(roomId);
+  if (!room) return;
 
-  for (const peer of peers) {
+  for (const peer of room.peers) {
     if (peer !== sender && peer.readyState === peer.OPEN) {
       send(peer, obj);
     }
   }
 };
 
-/* =========================
-   WEBSOCKET HANDLING
-   ========================= */
-
 wss.on('connection', (ws) => {
-  let room = null;
+  let roomId = null;
 
   ws.on('message', (raw) => {
     let data;
@@ -61,68 +49,69 @@ wss.on('connection', (ws) => {
     }
 
     const { type, payload } = data;
-    room = data.room ?? room;
+    roomId = data.room ?? roomId;
+    if (!roomId || !type) return;
 
-    if (!room || !type) return;
-
-    /* ───── JOIN (RELAXED) ───── */
+    /* ───── JOIN ───── */
     if (type === 'join') {
-      if (!rooms.has(room)) {
-        rooms.set(room, new Set());
+      if (!rooms.has(roomId)) {
+        rooms.set(roomId, {
+          peers: new Set(),
+          lastOffer: null,
+          lastAnswer: null,
+        });
       }
 
-      rooms.get(room).add(ws);
+      const room = rooms.get(roomId);
+      room.peers.add(ws);
 
-      // Notify presence
-      broadcastExceptSender(room, ws, { type: 'peer-present', room });
-      send(ws, { type: 'peer-present', room });
+      broadcastExceptSender(roomId, ws, { type: 'peer-present', room: roomId });
+      send(ws, { type: 'peer-present', room: roomId });
 
-      // For testing: announce readiness (does NOT affect SDP)
-      broadcastExceptSender(room, null, { type: 'moment-ready', room });
+      // 🔑 REPLAY SDP IF IT EXISTS
+      if (room.lastOffer) send(ws, room.lastOffer);
+      if (room.lastAnswer) send(ws, room.lastAnswer);
+
+      broadcastExceptSender(roomId, null, { type: 'moment-ready', room: roomId });
       return;
     }
 
-    /* ───── SDP / ICE RELAY (CRITICAL FIX) ───── */
-    if (type === 'offer' || type === 'answer' || type === 'candidate') {
-      // 🚫 NEVER echo back to sender
-      broadcastExceptSender(room, ws, {
-        type,
-        room,
-        payload,
-      });
+    /* ───── OFFER ───── */
+    if (type === 'offer') {
+      const room = rooms.get(roomId);
+      if (!room) return;
+
+      room.lastOffer = { type: 'offer', room: roomId, payload };
+      broadcastExceptSender(roomId, ws, room.lastOffer);
       return;
     }
 
-    /* ───── OTHER CONTROL MESSAGES ───── */
-    broadcastExceptSender(room, ws, {
-      type,
-      room,
-      payload,
-    });
+    /* ───── ANSWER ───── */
+    if (type === 'answer') {
+      const room = rooms.get(roomId);
+      if (!room) return;
+
+      room.lastAnswer = { type: 'answer', room: roomId, payload };
+      broadcastExceptSender(roomId, ws, room.lastAnswer);
+      return;
+    }
+
+    /* ───── ICE ───── */
+    if (type === 'candidate') {
+      broadcastExceptSender(roomId, ws, { type, room: roomId, payload });
+      return;
+    }
   });
 
   ws.on('close', () => {
-    if (room && rooms.has(room)) {
-      rooms.get(room).delete(ws);
-      broadcastExceptSender(room, ws, { type: 'peer-left', room });
-
-      if (rooms.get(room).size === 0) {
-        rooms.delete(room);
-      }
-    }
-  });
-
-  ws.on('error', () => {
-    if (room && rooms.has(room)) {
-      rooms.get(room).delete(ws);
-    }
+    if (!roomId || !rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    room.peers.delete(ws);
+    broadcastExceptSender(roomId, ws, { type: 'peer-left', room: roomId });
+    if (room.peers.size === 0) rooms.delete(roomId);
   });
 });
 
-/* =========================
-   START
-   ========================= */
-
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`⚠️ Hi Presence RELAXED signaling server running on ${PORT}`);
+  console.log(`✅ Hi Presence RELIABLE signaling server running on ${PORT}`);
 });
