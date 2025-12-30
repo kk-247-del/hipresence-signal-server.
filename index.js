@@ -16,7 +16,8 @@ app.use(cors());
  *   peers: Map<WebSocket, { role: 'offerer' | 'answerer' | null }>,
  *   quorum: number,
  *   lastOffer: object | null,
- *   lastAnswer: object | null
+ *   lastAnswer: object | null,
+ *   momentReadyEmitted: boolean
  * }>
  */
 const rooms = new Map();
@@ -46,12 +47,16 @@ const maybeEmitMomentReady = (roomId) => {
   const room = rooms.get(roomId);
   if (!room) return;
 
+  if (room.momentReadyEmitted) return;
+
   const ready =
     room.peers.size >= room.quorum &&
     room.lastOffer !== null &&
     room.lastAnswer !== null;
 
   if (!ready) return;
+
+  room.momentReadyEmitted = true;
 
   for (const peer of room.peers.keys()) {
     send(peer, { type: 'moment-ready', room: roomId });
@@ -87,37 +92,33 @@ wss.on('connection', (ws) => {
           quorum,
           lastOffer: null,
           lastAnswer: null,
+          momentReadyEmitted: false,
         });
       }
 
       const room = rooms.get(roomId);
-
       room.peers.set(ws, { role: null });
 
-      // Notify others
       broadcastExceptSender(roomId, ws, {
         type: 'peer-present',
         room: roomId,
       });
 
-      // Notify self
       send(ws, { type: 'peer-present', room: roomId });
 
-      // 🔁 Replay SDP IN ORDER
+      // Replay SDP deterministically
       if (room.lastOffer) send(ws, room.lastOffer);
       if (room.lastAnswer) send(ws, room.lastAnswer);
 
-      // Only emit moment-ready if conditions are truly met
       maybeEmitMomentReady(roomId);
       return;
     }
 
+    const room = rooms.get(roomId);
+    if (!room || !room.peers.has(ws)) return;
+
     /* ───────── OFFER ───────── */
     if (type === 'offer') {
-      const room = rooms.get(roomId);
-      if (!room) return;
-
-      // ❌ Reject second offer
       if (room.lastOffer) return;
 
       room.lastOffer = { type: 'offer', room: roomId, payload };
@@ -130,13 +131,7 @@ wss.on('connection', (ws) => {
 
     /* ───────── ANSWER ───────── */
     if (type === 'answer') {
-      const room = rooms.get(roomId);
-      if (!room) return;
-
-      // ❌ No answer without offer
       if (!room.lastOffer) return;
-
-      // ❌ Reject second answer
       if (room.lastAnswer) return;
 
       room.lastAnswer = { type: 'answer', room: roomId, payload };
@@ -149,10 +144,6 @@ wss.on('connection', (ws) => {
 
     /* ───────── ICE ───────── */
     if (type === 'candidate') {
-      const room = rooms.get(roomId);
-      if (!room) return;
-
-      // Only forward ICE AFTER SDP exchange exists
       if (!room.lastOffer || !room.lastAnswer) return;
 
       broadcastExceptSender(roomId, ws, {
