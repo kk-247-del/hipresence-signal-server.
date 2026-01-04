@@ -11,6 +11,14 @@ const wss = new WebSocketServer({ server });
 
 app.use(cors());
 
+/* ─────────────────────────────────────────────
+   🔑 REQUIRED FOR RENDER WEBSOCKET ROUTING
+   (DO NOT REMOVE)
+   ───────────────────────────────────────────── */
+app.get('/', (req, res) => {
+  res.status(200).send('Hi Presence signaling server');
+});
+
 /**
  * rooms: Map<roomId, {
  *   peers: Map<WebSocket, { role: 'offerer' | 'answerer' | null }>,
@@ -54,11 +62,7 @@ const maybeEmitMomentReady = (roomId) => {
   if (!ready) return;
 
   for (const peer of room.peers.keys()) {
-    send(peer, {
-      type: 'moment-ready',
-      room: roomId,
-      payload: {},
-    });
+    send(peer, { type: 'moment-ready', room: roomId, payload: {} });
   }
 };
 
@@ -67,6 +71,8 @@ const maybeEmitMomentReady = (roomId) => {
    ───────────────────────────────────────────── */
 
 wss.on('connection', (ws) => {
+  console.log('🟢 client connected');
+
   let roomId = null;
 
   ws.on('message', (raw) => {
@@ -97,21 +103,14 @@ wss.on('connection', (ws) => {
       const room = rooms.get(roomId);
       room.peers.set(ws, { role: null });
 
-      // Notify others
       broadcastExceptSender(roomId, ws, {
         type: 'peer-present',
         room: roomId,
         payload: {},
       });
 
-      // Notify self
-      send(ws, {
-        type: 'peer-present',
-        room: roomId,
-        payload: {},
-      });
+      send(ws, { type: 'peer-present', room: roomId, payload: {} });
 
-      // Replay SDP if it exists
       if (room.lastOffer) send(ws, room.lastOffer);
       if (room.lastAnswer) send(ws, room.lastAnswer);
 
@@ -122,20 +121,20 @@ wss.on('connection', (ws) => {
     /* ───────── OFFER ───────── */
     if (type === 'offer') {
       const room = rooms.get(roomId);
-      if (!room) return;
+      if (!room || room.lastOffer) return;
 
-      // Reject duplicate offers
-      if (room.lastOffer) return;
-
-      // ✅ FIX: DO NOT RE-WRAP SDP
       room.lastOffer = {
         type: 'offer',
         room: roomId,
-        payload: payload,
+        payload: {
+          sdp: {
+            type: 'offer',
+            sdp: payload.sdp,
+          },
+        },
       };
 
       room.peers.get(ws).role = 'offerer';
-
       broadcastExceptSender(roomId, ws, room.lastOffer);
       maybeEmitMomentReady(roomId);
       return;
@@ -144,20 +143,20 @@ wss.on('connection', (ws) => {
     /* ───────── ANSWER ───────── */
     if (type === 'answer') {
       const room = rooms.get(roomId);
-      if (!room) return;
+      if (!room || !room.lastOffer || room.lastAnswer) return;
 
-      if (!room.lastOffer) return;
-      if (room.lastAnswer) return;
-
-      // ✅ FIX: DO NOT RE-WRAP SDP
       room.lastAnswer = {
         type: 'answer',
         room: roomId,
-        payload: payload,
+        payload: {
+          sdp: {
+            type: 'answer',
+            sdp: payload.sdp,
+          },
+        },
       };
 
       room.peers.get(ws).role = 'answerer';
-
       broadcastExceptSender(roomId, ws, room.lastAnswer);
       maybeEmitMomentReady(roomId);
       return;
@@ -166,10 +165,7 @@ wss.on('connection', (ws) => {
     /* ───────── ICE ───────── */
     if (type === 'candidate') {
       const room = rooms.get(roomId);
-      if (!room) return;
-
-      // ✅ FIX: Allow ICE after offer exists
-      if (!room.lastOffer) return;
+      if (!room || !room.lastOffer || !room.lastAnswer) return;
 
       broadcastExceptSender(roomId, ws, {
         type: 'candidate',
@@ -181,6 +177,8 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    console.log('🔴 client disconnected');
+
     if (!roomId || !rooms.has(roomId)) return;
 
     const room = rooms.get(roomId);
