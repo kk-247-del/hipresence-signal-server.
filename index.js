@@ -3,21 +3,26 @@ import express from 'express';
 import http from 'http';
 import cors from 'cors';
 
-const PORT = process.env.PORT || 8080;
+/* ─────────────────────────────────────────────
+   RENDER-SAFE BOOTSTRAP
+   ───────────────────────────────────────────── */
+
+const PORT = Number(process.env.PORT);
+
+if (!PORT) {
+  throw new Error('❌ PORT not provided by Render');
+}
 
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
-
 app.use(cors());
 
+const server = http.createServer(app);
+
 /* ─────────────────────────────────────────────
-   🔑 REQUIRED FOR RENDER WEBSOCKET ROUTING
-   (DO NOT REMOVE)
+   WEBSOCKET SERVER
    ───────────────────────────────────────────── */
-app.get('/', (req, res) => {
-  res.status(200).send('Hi Presence signaling server');
-});
+
+const wss = new WebSocketServer({ server });
 
 /**
  * rooms: Map<roomId, {
@@ -62,7 +67,11 @@ const maybeEmitMomentReady = (roomId) => {
   if (!ready) return;
 
   for (const peer of room.peers.keys()) {
-    send(peer, { type: 'moment-ready', room: roomId, payload: {} });
+    send(peer, {
+      type: 'moment-ready',
+      room: roomId,
+      payload: {},
+    });
   }
 };
 
@@ -71,7 +80,7 @@ const maybeEmitMomentReady = (roomId) => {
    ───────────────────────────────────────────── */
 
 wss.on('connection', (ws) => {
-  console.log('🟢 client connected');
+  console.log('🟢 WebSocket client connected');
 
   let roomId = null;
 
@@ -80,11 +89,13 @@ wss.on('connection', (ws) => {
     try {
       msg = JSON.parse(raw.toString());
     } catch {
+      console.warn('⚠️ Invalid JSON');
       return;
     }
 
     const { type, payload } = msg;
     roomId = msg.room ?? roomId;
+
     if (!roomId || !type) return;
 
     /* ───────── JOIN ───────── */
@@ -103,14 +114,23 @@ wss.on('connection', (ws) => {
       const room = rooms.get(roomId);
       room.peers.set(ws, { role: null });
 
+      console.log(`👥 joined room ${roomId} (${room.peers.size})`);
+
+      // notify others
       broadcastExceptSender(roomId, ws, {
         type: 'peer-present',
         room: roomId,
         payload: {},
       });
 
-      send(ws, { type: 'peer-present', room: roomId, payload: {} });
+      // notify self
+      send(ws, {
+        type: 'peer-present',
+        room: roomId,
+        payload: {},
+      });
 
+      // replay SDP if present
       if (room.lastOffer) send(ws, room.lastOffer);
       if (room.lastAnswer) send(ws, room.lastAnswer);
 
@@ -127,10 +147,7 @@ wss.on('connection', (ws) => {
         type: 'offer',
         room: roomId,
         payload: {
-          sdp: {
-            type: 'offer',
-            sdp: payload.sdp,
-          },
+          sdp: payload.sdp,
         },
       };
 
@@ -149,10 +166,7 @@ wss.on('connection', (ws) => {
         type: 'answer',
         room: roomId,
         payload: {
-          sdp: {
-            type: 'answer',
-            sdp: payload.sdp,
-          },
+          sdp: payload.sdp,
         },
       };
 
@@ -172,12 +186,11 @@ wss.on('connection', (ws) => {
         room: roomId,
         payload,
       });
-      return;
     }
   });
 
   ws.on('close', () => {
-    console.log('🔴 client disconnected');
+    console.log('🔴 WebSocket client disconnected');
 
     if (!roomId || !rooms.has(roomId)) return;
 
@@ -197,9 +210,9 @@ wss.on('connection', (ws) => {
 });
 
 /* ─────────────────────────────────────────────
-   SERVER START
+   START SERVER (RENDER-COMPLIANT)
    ───────────────────────────────────────────── */
 
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, () => {
   console.log(`✅ Hi Presence signaling server running on ${PORT}`);
 });
