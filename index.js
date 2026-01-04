@@ -54,7 +54,11 @@ const maybeEmitMomentReady = (roomId) => {
   if (!ready) return;
 
   for (const peer of room.peers.keys()) {
-    send(peer, { type: 'moment-ready', room: roomId, payload: {} });
+    send(peer, {
+      type: 'moment-ready',
+      room: roomId,
+      payload: {},
+    });
   }
 };
 
@@ -101,9 +105,13 @@ wss.on('connection', (ws) => {
       });
 
       // Notify self
-      send(ws, { type: 'peer-present', room: roomId, payload: {} });
+      send(ws, {
+        type: 'peer-present',
+        room: roomId,
+        payload: {},
+      });
 
-      // Replay SDP in correct order if it exists
+      // Replay SDP if it exists
       if (room.lastOffer) send(ws, room.lastOffer);
       if (room.lastAnswer) send(ws, room.lastAnswer);
 
@@ -119,16 +127,11 @@ wss.on('connection', (ws) => {
       // Reject duplicate offers
       if (room.lastOffer) return;
 
-      // ✅ CANONICAL SDP SHAPE
+      // ✅ FIX: DO NOT RE-WRAP SDP
       room.lastOffer = {
         type: 'offer',
         room: roomId,
-        payload: {
-          sdp: {
-            type: 'offer',
-            sdp: payload.sdp,
-          },
-        },
+        payload: payload,
       };
 
       room.peers.get(ws).role = 'offerer';
@@ -146,16 +149,11 @@ wss.on('connection', (ws) => {
       if (!room.lastOffer) return;
       if (room.lastAnswer) return;
 
-      // ✅ CANONICAL SDP SHAPE
+      // ✅ FIX: DO NOT RE-WRAP SDP
       room.lastAnswer = {
         type: 'answer',
         room: roomId,
-        payload: {
-          sdp: {
-            type: 'answer',
-            sdp: payload.sdp,
-          },
-        },
+        payload: payload,
       };
 
       room.peers.get(ws).role = 'answerer';
@@ -170,8 +168,8 @@ wss.on('connection', (ws) => {
       const room = rooms.get(roomId);
       if (!room) return;
 
-      // Only forward ICE after SDP exchange exists
-      if (!room.lastOffer || !room.lastAnswer) return;
+      // ✅ FIX: Allow ICE after offer exists
+      if (!room.lastOffer) return;
 
       broadcastExceptSender(roomId, ws, {
         type: 'candidate',
