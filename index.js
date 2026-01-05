@@ -24,8 +24,8 @@ const wss = new WebSocketServer({ server });
 rooms: Map<roomId, {
   peers: Set<WebSocket>,
   quorum: number,
-  lastOffer: object | null,
-  lastAnswer: object | null
+  offer: object | null,
+  answer: object | null
 }>
 */
 const rooms = new Map();
@@ -57,8 +57,8 @@ function maybeEmitMomentReady(roomId) {
 
   if (
     room.peers.size >= room.quorum &&
-    room.lastOffer &&
-    room.lastAnswer
+    room.offer &&
+    room.answer
   ) {
     for (const peer of room.peers) {
       send(peer, {
@@ -75,8 +75,6 @@ function maybeEmitMomentReady(roomId) {
    ───────────────────────────────────────────── */
 
 wss.on('connection', (ws) => {
-  console.log('WS CONNECTED');
-
   let joinedRoom = null;
 
   ws.on('message', (raw) => {
@@ -84,7 +82,6 @@ wss.on('connection', (ws) => {
     try {
       msg = JSON.parse(raw.toString());
     } catch {
-      console.warn('INVALID JSON');
       return;
     }
 
@@ -99,15 +96,13 @@ wss.on('connection', (ws) => {
         rooms.set(room, {
           peers: new Set(),
           quorum: payload?.quorum ?? 2,
-          lastOffer: null,
-          lastAnswer: null,
+          offer: null,
+          answer: null,
         });
       }
 
       const r = rooms.get(room);
       r.peers.add(ws);
-
-      console.log('JOIN', room, 'PEERS', r.peers.size);
 
       broadcast(room, ws, {
         type: 'peer-present',
@@ -121,46 +116,42 @@ wss.on('connection', (ws) => {
         payload: {},
       });
 
-      if (r.lastOffer) send(ws, r.lastOffer);
-      if (r.lastAnswer) send(ws, r.lastAnswer);
+      // Late joiners get current offer only
+      if (r.offer) send(ws, r.offer);
 
       maybeEmitMomentReady(room);
       return;
     }
 
-    if (!joinedRoom || !rooms.has(joinedRoom)) return;
+    if (!joinedRoom) return;
     const r = rooms.get(joinedRoom);
+    if (!r) return;
 
     /* ───────── OFFER ───────── */
     if (type === 'offer') {
-      if (r.lastOffer) return;
-
-      r.lastOffer = {
+      r.offer = {
         type: 'offer',
         room: joinedRoom,
         payload,
       };
 
-      console.log('OFFER', joinedRoom);
+      r.answer = null; // invalidate any stale answer
 
-      broadcast(joinedRoom, ws, r.lastOffer);
-      maybeEmitMomentReady(joinedRoom);
+      broadcast(joinedRoom, ws, r.offer);
       return;
     }
 
     /* ───────── ANSWER ───────── */
     if (type === 'answer') {
-      if (!r.lastOffer || r.lastAnswer) return;
+      if (!r.offer) return;
 
-      r.lastAnswer = {
+      r.answer = {
         type: 'answer',
         room: joinedRoom,
         payload,
       };
 
-      console.log('ANSWER', joinedRoom);
-
-      broadcast(joinedRoom, ws, r.lastAnswer);
+      broadcast(joinedRoom, ws, r.answer);
       maybeEmitMomentReady(joinedRoom);
       return;
     }
@@ -176,13 +167,15 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    console.log('WS DISCONNECTED');
-
     if (!joinedRoom) return;
     const r = rooms.get(joinedRoom);
     if (!r) return;
 
     r.peers.delete(ws);
+
+    // Reset negotiation if anyone leaves
+    r.offer = null;
+    r.answer = null;
 
     broadcast(joinedRoom, ws, {
       type: 'peer-left',
