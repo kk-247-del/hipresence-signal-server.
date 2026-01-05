@@ -28,7 +28,7 @@ rooms: Map<roomId, {
 */
 const rooms = new Map();
 
-/* ───────── UTIL ───────── */
+/* ───────── UTILITIES ───────── */
 
 function send(ws, msg) {
   if (ws.readyState === ws.OPEN) {
@@ -36,21 +36,21 @@ function send(ws, msg) {
   }
 }
 
-function broadcast(room, msg) {
-  for (const peer of room.peers) {
+function broadcast(roomObj, msg) {
+  for (const peer of roomObj.peers) {
     send(peer, msg);
   }
 }
 
-function broadcastExcept(room, sender, msg) {
-  for (const peer of room.peers) {
+function broadcastExcept(roomObj, sender, msg) {
+  for (const peer of roomObj.peers) {
     if (peer !== sender) {
       send(peer, msg);
     }
   }
 }
 
-/* ───────── WS ───────── */
+/* ───────── WEBSOCKET ───────── */
 
 wss.on('connection', (ws) => {
   let roomId = null;
@@ -63,8 +63,9 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    const { type, room, payload } = msg;
-    if (room) roomId = room;
+    const type = msg.type;
+    const payload = msg.payload;
+    if (msg.room) roomId = msg.room;
     if (!roomId || !type) return;
 
     /* ───── JOIN ───── */
@@ -78,10 +79,10 @@ wss.on('connection', (ws) => {
         });
       }
 
-      const room = rooms.get(roomId);
-      room.peers.add(ws);
+      const roomObj = rooms.get(roomId);
+      roomObj.peers.add(ws);
 
-      broadcastExcept(room, ws, {
+      broadcastExcept(roomObj, ws, {
         type: 'peer-present',
         room: roomId,
         payload: {},
@@ -93,20 +94,20 @@ wss.on('connection', (ws) => {
         payload: {},
       });
 
-      if (room.lastOffer) send(ws, room.lastOffer);
-      if (room.lastAnswer) send(ws, room.lastAnswer);
+      if (roomObj.lastOffer) send(ws, roomObj.lastOffer);
+      if (roomObj.lastAnswer) send(ws, roomObj.lastAnswer);
 
       return;
     }
 
-    const room = rooms.get(roomId);
-    if (!room) return;
+    const roomObj = rooms.get(roomId);
+    if (!roomObj) return;
 
     /* ───── ARM OFFER ───── */
     if (type === 'arm-offer') {
-      room.armedOfferer = ws;
+      roomObj.armedOfferer = ws;
 
-      broadcast(room, {
+      broadcast(roomObj, {
         type: 'offer-armed',
         room: roomId,
         payload: {},
@@ -117,35 +118,35 @@ wss.on('connection', (ws) => {
 
     /* ───── OFFER ───── */
     if (type === 'offer') {
-      if (room.armedOfferer !== ws) return;
+      if (roomObj.armedOfferer !== ws) return;
 
-      room.lastOffer = {
+      roomObj.lastOffer = {
         type: 'offer',
         room: roomId,
         payload,
       };
 
-      broadcastExcept(room, ws, room.lastOffer);
+      broadcastExcept(roomObj, ws, roomObj.lastOffer);
       return;
     }
 
     /* ───── ANSWER ───── */
     if (type === 'answer') {
-      if (!room.lastOffer) return;
+      if (!roomObj.lastOffer) return;
 
-      room.lastAnswer = {
+      roomObj.lastAnswer = {
         type: 'answer',
         room: roomId,
         payload,
       };
 
-      broadcastExcept(room, ws, room.lastAnswer);
+      broadcastExcept(roomObj, ws, roomObj.lastAnswer);
       return;
     }
 
     /* ───── ICE ───── */
     if (type === 'candidate') {
-      broadcastExcept(room, ws, {
+      broadcastExcept(roomObj, ws, {
         type: 'candidate',
         room: roomId,
         payload,
@@ -155,17 +156,19 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     if (!roomId) return;
-    const room = rooms.get(roomId);
-    if (!room) return;
 
-    room.peers.delete(ws);
-    if (room.armedOfferer === ws) {
-      room.armedOfferer = null;
-      room.lastOffer = null;
-      room.lastAnswer = null;
+    const roomObj = rooms.get(roomId);
+    if (!roomObj) return;
+
+    roomObj.peers.delete(ws);
+
+    if (roomObj.armedOfferer === ws) {
+      roomObj.armedOfferer = null;
+      roomObj.lastOffer = null;
+      roomObj.lastAnswer = null;
     }
 
-    if (room.peers.size === 0) {
+    if (roomObj.peers.size === 0) {
       rooms.delete(roomId);
     }
   });
