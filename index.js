@@ -8,20 +8,18 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(cors());
 
-// ✅ REQUIRED FOR RENDER
 app.get('/', (_, res) => {
   res.status(200).send('Hi Presence signaling server alive');
 });
 
 const server = http.createServer(app);
-
-// ✅ EXPLICIT WS SERVER
 const wss = new WebSocketServer({ server });
 
 /*
 rooms: Map<roomId, {
   peers: Set<WebSocket>,
-  quorum: number
+  lastOffer: object | null,
+  lastAnswer: object | null
 }>
 */
 const rooms = new Map();
@@ -45,68 +43,75 @@ function broadcast(roomId, except, msg) {
 
 wss.on('connection', (ws) => {
   console.log('WS CONNECTED');
-
-  let joinedRoom = null;
+  let roomId = null;
 
   ws.on('message', (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw.toString());
     } catch {
-      console.log('INVALID JSON');
       return;
     }
 
     const { type, room, payload } = msg;
 
     if (type === 'join') {
-      console.log('JOIN RECEIVED', room);
+      console.log('JOIN', room);
+
+      roomId = room;
 
       if (!rooms.has(room)) {
         rooms.set(room, {
           peers: new Set(),
-          quorum: payload?.quorum ?? 2,
+          lastOffer: null,
+          lastAnswer: null,
         });
       }
 
       const r = rooms.get(room);
       r.peers.add(ws);
-      joinedRoom = room;
 
-      // ACK SELF
-      send(ws, {
-        type: 'peer-present',
-        room,
-        payload: {},
-      });
+      // ACK self
+      send(ws, { type: 'peer-present', room, payload: {} });
 
-      // NOTIFY OTHERS
-      broadcast(room, ws, {
-        type: 'peer-present',
-        room,
-        payload: {},
-      });
+      // Notify others
+      broadcast(room, ws, { type: 'peer-present', room, payload: {} });
+
+      // 🔑 REPLAY SDP IF IT EXISTS
+      if (r.lastOffer) send(ws, r.lastOffer);
+      if (r.lastAnswer) send(ws, r.lastAnswer);
 
       return;
     }
 
-    // RELAY EVERYTHING ELSE
-    if (joinedRoom) {
-      broadcast(joinedRoom, ws, msg);
+    if (!roomId || !rooms.has(roomId)) return;
+
+    const r = rooms.get(roomId);
+
+    if (type === 'offer') {
+      r.lastOffer = msg;
+      broadcast(roomId, ws, msg);
+      return;
     }
+
+    if (type === 'answer') {
+      r.lastAnswer = msg;
+      broadcast(roomId, ws, msg);
+      return;
+    }
+
+    // ICE
+    broadcast(roomId, ws, msg);
   });
 
   ws.on('close', () => {
-    console.log('WS CLOSED');
+    if (!roomId || !rooms.has(roomId)) return;
 
-    if (!joinedRoom) return;
-
-    const r = rooms.get(joinedRoom);
-    if (!r) return;
-
+    const r = rooms.get(roomId);
     r.peers.delete(ws);
+
     if (r.peers.size === 0) {
-      rooms.delete(joinedRoom);
+      rooms.delete(roomId);
     }
   });
 });
