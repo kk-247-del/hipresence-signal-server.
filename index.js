@@ -3,25 +3,15 @@ import express from 'express';
 import http from 'http';
 import cors from 'cors';
 
-/* ─────────────────────────────────────────────
-   RENDER-SAFE BOOTSTRAP
-   ───────────────────────────────────────────── */
-
 const PORT = Number(process.env.PORT);
-
 if (!PORT) {
-  throw new Error('❌ PORT not provided by Render');
+  throw new Error('PORT not provided by Render');
 }
 
 const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
-
-/* ─────────────────────────────────────────────
-   WEBSOCKET SERVER
-   ───────────────────────────────────────────── */
-
 const wss = new WebSocketServer({ server });
 
 /**
@@ -34,9 +24,7 @@ const wss = new WebSocketServer({ server });
  */
 const rooms = new Map();
 
-/* ─────────────────────────────────────────────
-   UTILITIES
-   ───────────────────────────────────────────── */
+/* ───────── Utilities ───────── */
 
 const send = (ws, obj) => {
   if (ws.readyState === ws.OPEN) {
@@ -75,13 +63,9 @@ const maybeEmitMomentReady = (roomId) => {
   }
 };
 
-/* ─────────────────────────────────────────────
-   WEBSOCKET HANDLING
-   ───────────────────────────────────────────── */
+/* ───────── WebSocket ───────── */
 
 wss.on('connection', (ws) => {
-  console.log('🟢 WebSocket client connected');
-
   let roomId = null;
 
   ws.on('message', (raw) => {
@@ -89,16 +73,13 @@ wss.on('connection', (ws) => {
     try {
       msg = JSON.parse(raw.toString());
     } catch {
-      console.warn('⚠️ Invalid JSON');
       return;
     }
 
     const { type, payload } = msg;
     roomId = msg.room ?? roomId;
-
     if (!roomId || !type) return;
 
-    /* ───────── JOIN ───────── */
     if (type === 'join') {
       const quorum = payload?.quorum ?? 2;
 
@@ -114,23 +95,12 @@ wss.on('connection', (ws) => {
       const room = rooms.get(roomId);
       room.peers.set(ws, { role: null });
 
-      console.log(`👥 joined room ${roomId} (${room.peers.size})`);
-
-      // notify others
       broadcastExceptSender(roomId, ws, {
         type: 'peer-present',
         room: roomId,
         payload: {},
       });
 
-      // notify self
-      send(ws, {
-        type: 'peer-present',
-        room: roomId,
-        payload: {},
-      });
-
-      // replay SDP if present
       if (room.lastOffer) send(ws, room.lastOffer);
       if (room.lastAnswer) send(ws, room.lastAnswer);
 
@@ -138,7 +108,6 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    /* ───────── OFFER ───────── */
     if (type === 'offer') {
       const room = rooms.get(roomId);
       if (!room || room.lastOffer) return;
@@ -146,9 +115,7 @@ wss.on('connection', (ws) => {
       room.lastOffer = {
         type: 'offer',
         room: roomId,
-        payload: {
-          sdp: payload.sdp,
-        },
+        payload: { sdp: payload.sdp },
       };
 
       room.peers.get(ws).role = 'offerer';
@@ -157,7 +124,6 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    /* ───────── ANSWER ───────── */
     if (type === 'answer') {
       const room = rooms.get(roomId);
       if (!room || !room.lastOffer || room.lastAnswer) return;
@@ -165,9 +131,7 @@ wss.on('connection', (ws) => {
       room.lastAnswer = {
         type: 'answer',
         room: roomId,
-        payload: {
-          sdp: payload.sdp,
-        },
+        payload: { sdp: payload.sdp },
       };
 
       room.peers.get(ws).role = 'answerer';
@@ -176,10 +140,9 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    /* ───────── ICE ───────── */
     if (type === 'candidate') {
       const room = rooms.get(roomId);
-      if (!room || !room.lastOffer || !room.lastAnswer) return;
+      if (!room) return;
 
       broadcastExceptSender(roomId, ws, {
         type: 'candidate',
@@ -190,8 +153,6 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    console.log('🔴 WebSocket client disconnected');
-
     if (!roomId || !rooms.has(roomId)) return;
 
     const room = rooms.get(roomId);
@@ -209,10 +170,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-/* ─────────────────────────────────────────────
-   START SERVER (RENDER-COMPLIANT)
-   ───────────────────────────────────────────── */
-
 server.listen(PORT, () => {
-  console.log(`✅ Hi Presence signaling server running on ${PORT}`);
+  console.log(`Signaling server running on ${PORT}`);
 });
