@@ -1,21 +1,34 @@
+import { WebSocketServer } from 'ws';
 import express from 'express';
 import http from 'http';
-import { WebSocketServer } from 'ws';
 import cors from 'cors';
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT);
+if (!PORT) {
+  throw new Error('PORT not provided');
+}
 
 const app = express();
 app.use(cors());
 
 app.get('/', (_, res) => {
-  res.status(200).send('Hi Presence signaling server alive');
+  res.status(200).send('Hi Presence signaling server');
 });
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+/*
+rooms: Map<roomId, {
+  peers: Set<WebSocket>,
+  armedOfferer: WebSocket | null,
+  lastOffer: object | null,
+  lastAnswer: object | null
+}>
+*/
 const rooms = new Map();
+
+/* ───────── UTIL ───────── */
 
 function send(ws, msg) {
   if (ws.readyState === ws.OPEN) {
@@ -23,16 +36,21 @@ function send(ws, msg) {
   }
 }
 
-function broadcast(roomId, except, msg) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-
+function broadcast(room, msg) {
   for (const peer of room.peers) {
-    if (peer !== except) {
+    send(peer, msg);
+  }
+}
+
+function broadcastExcept(room, sender, msg) {
+  for (const peer of room.peers) {
+    if (peer !== sender) {
       send(peer, msg);
     }
   }
 }
+
+/* ───────── WS ───────── */
 
 wss.on('connection', (ws) => {
   let roomId = null;
@@ -46,61 +64,113 @@ wss.on('connection', (ws) => {
     }
 
     const { type, room, payload } = msg;
+    if (room) roomId = room;
+    if (!roomId || !type) return;
 
+    /* ───── JOIN ───── */
     if (type === 'join') {
-      roomId = room;
-
-      if (!rooms.has(room)) {
-        rooms.set(room, {
+      if (!rooms.has(roomId)) {
+        rooms.set(roomId, {
           peers: new Set(),
+          armedOfferer: null,
           lastOffer: null,
           lastAnswer: null,
         });
       }
 
-      const r = rooms.get(room);
-      r.peers.add(ws);
+      const room = rooms.get(roomId);
+      room.peers.add(ws);
 
-      send(ws, { type: 'peer-present', room, payload: {} });
-      broadcast(room, ws, { type: 'peer-present', room, payload: {} });
+      broadcastExcept(room, ws, {
+        type: 'peer-present',
+        room: roomId,
+        payload: {},
+      });
 
-      if (r.lastOffer) send(ws, r.lastOffer);
-      if (r.lastAnswer) send(ws, r.lastAnswer);
+      send(ws, {
+        type: 'peer-present',
+        room: roomId,
+        payload: {},
+      });
+
+      if (room.lastOffer) send(ws, room.lastOffer);
+      if (room.lastAnswer) send(ws, room.lastAnswer);
 
       return;
     }
 
-    if (!roomId || !rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (!room) return;
 
-    const r = rooms.get(roomId);
+    /* ───── ARM OFFER ───── */
+    if (type === 'arm-offer') {
+      room.armedOfferer = ws;
 
+      broadcast(room, {
+        type: 'offer-armed',
+        room: roomId,
+        payload: {},
+      });
+
+      return;
+    }
+
+    /* ───── OFFER ───── */
     if (type === 'offer') {
-      r.lastOffer = msg;
-      setTimeout(() => {
-        broadcast(roomId, ws, msg);
-      }, 0);
+      if (room.armedOfferer !== ws) return;
+
+      room.lastOffer = {
+        type: 'offer',
+        room: roomId,
+        payload,
+      };
+
+      broadcastExcept(room, ws, room.lastOffer);
       return;
     }
 
+    /* ───── ANSWER ───── */
     if (type === 'answer') {
-      r.lastAnswer = msg;
-      broadcast(roomId, ws, msg);
+      if (!room.lastOffer) return;
+
+      room.lastAnswer = {
+        type: 'answer',
+        room: roomId,
+        payload,
+      };
+
+      broadcastExcept(room, ws, room.lastAnswer);
       return;
     }
 
-    broadcast(roomId, ws, msg);
+    /* ───── ICE ───── */
+    if (type === 'candidate') {
+      broadcastExcept(room, ws, {
+        type: 'candidate',
+        room: roomId,
+        payload,
+      });
+    }
   });
 
   ws.on('close', () => {
-    if (!roomId || !rooms.has(roomId)) return;
+    if (!roomId) return;
+    const room = rooms.get(roomId);
+    if (!room) return;
 
-    const r = rooms.get(roomId);
-    r.peers.delete(ws);
+    room.peers.delete(ws);
+    if (room.armedOfferer === ws) {
+      room.armedOfferer = null;
+      room.lastOffer = null;
+      room.lastAnswer = null;
+    }
 
-    if (r.peers.size === 0) {
+    if (room.peers.size === 0) {
       rooms.delete(roomId);
     }
   });
 });
 
-server.listen(PORT);
+server.listen(PORT, () => {
+  console.log(`Hi Presence signaling server running on ${PORT}`);
+});
