@@ -15,13 +15,6 @@ app.get('/', (_, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-/*
-rooms: Map<roomId, {
-  peers: Set<WebSocket>,
-  lastOffer: object | null,
-  lastAnswer: object | null
-}>
-*/
 const rooms = new Map();
 
 function send(ws, msg) {
@@ -42,7 +35,6 @@ function broadcast(roomId, except, msg) {
 }
 
 wss.on('connection', (ws) => {
-  console.log('WS CONNECTED');
   let roomId = null;
 
   ws.on('message', (raw) => {
@@ -56,8 +48,6 @@ wss.on('connection', (ws) => {
     const { type, room, payload } = msg;
 
     if (type === 'join') {
-      console.log('JOIN', room);
-
       roomId = room;
 
       if (!rooms.has(room)) {
@@ -71,13 +61,9 @@ wss.on('connection', (ws) => {
       const r = rooms.get(room);
       r.peers.add(ws);
 
-      // ACK self
       send(ws, { type: 'peer-present', room, payload: {} });
-
-      // Notify others
       broadcast(room, ws, { type: 'peer-present', room, payload: {} });
 
-      // 🔑 REPLAY SDP IF IT EXISTS
       if (r.lastOffer) send(ws, r.lastOffer);
       if (r.lastAnswer) send(ws, r.lastAnswer);
 
@@ -90,7 +76,9 @@ wss.on('connection', (ws) => {
 
     if (type === 'offer') {
       r.lastOffer = msg;
-      broadcast(roomId, ws, msg);
+      setTimeout(() => {
+        broadcast(roomId, ws, msg);
+      }, 0);
       return;
     }
 
@@ -100,7 +88,6 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ICE
     broadcast(roomId, ws, msg);
   });
 
@@ -116,6 +103,4 @@ wss.on('connection', (ws) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`SIGNALING SERVER RUNNING ON ${PORT}`);
-});
+server.listen(PORT);
