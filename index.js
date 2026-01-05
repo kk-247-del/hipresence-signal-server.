@@ -3,37 +3,22 @@ import express from 'express';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
 
-/* ─────────────────────────────────────────────
-   BOOTSTRAP
-   ───────────────────────────────────────────── */
-
 const PORT = Number(process.env.PORT || 10000);
 
 const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
-
-/* ─────────────────────────────────────────────
-   WEBSOCKET SERVER
-   ───────────────────────────────────────────── */
-
 const wss = new WebSocketServer({ server });
 
 /*
 rooms: Map<roomId, {
   peers: Set<WebSocket>,
-  offerer: WebSocket | null,
-  answerer: WebSocket | null,
   offer: object | null,
   answer: object | null
 }>
 */
 const rooms = new Map();
-
-/* ─────────────────────────────────────────────
-   HELPERS
-   ───────────────────────────────────────────── */
 
 function send(ws, msg) {
   if (ws.readyState === ws.OPEN) {
@@ -41,24 +26,31 @@ function send(ws, msg) {
   }
 }
 
-function collapseRoom(roomId) {
+function broadcast(roomId, except, msg) {
   const room = rooms.get(roomId);
   if (!room) return;
 
   for (const peer of room.peers) {
-    send(peer, {
-      type: 'moment-collapsed',
-      room: roomId,
-      payload: {},
-    });
+    if (peer !== except && peer.readyState === peer.OPEN) {
+      send(peer, msg);
+    }
   }
-
-  rooms.delete(roomId);
 }
 
-/* ─────────────────────────────────────────────
-   CONNECTION HANDLING
-   ───────────────────────────────────────────── */
+function maybeReady(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+
+  if (room.offer && room.answer) {
+    for (const peer of room.peers) {
+      send(peer, {
+        type: 'moment-ready',
+        room: roomId,
+        payload: {},
+      });
+    }
+  }
+}
 
 wss.on('connection', (ws) => {
   let joinedRoom = null;
@@ -76,110 +68,91 @@ wss.on('connection', (ws) => {
 
     /* ───────── JOIN ───────── */
     if (type === 'join') {
+      joinedRoom = room;
+
       if (!rooms.has(room)) {
         rooms.set(room, {
           peers: new Set(),
-          offerer: null,
-          answerer: null,
           offer: null,
           answer: null,
         });
       }
 
       const r = rooms.get(room);
-
-      // STRICT: only 2 peers allowed
-      if (r.peers.size >= 2) {
-        send(ws, {
-          type: 'room-full',
-          room,
-          payload: {},
-        });
-        ws.close();
-        return;
-      }
-
-      joinedRoom = room;
       r.peers.add(ws);
 
-      send(ws, {
-        type: 'peer-present',
-        room,
-        payload: { count: r.peers.size },
-      });
+      // notify presence
+      for (const peer of r.peers) {
+        send(peer, {
+          type: 'peer-present',
+          room,
+          payload: { count: r.peers.size },
+        });
+      }
 
+      // 🔑 CRITICAL FIX: replay offer if it exists
+      if (r.offer) send(ws, r.offer);
+      if (r.answer) send(ws, r.answer);
+
+      maybeReady(room);
       return;
     }
 
     if (!joinedRoom) return;
     const r = rooms.get(joinedRoom);
-    if (!r) return;
 
     /* ───────── OFFER ───────── */
     if (type === 'offer') {
-      // First SDP sender becomes offerer
-      if (r.offerer && r.offerer !== ws) return;
+      if (!r.offer) {
+        r.offer = {
+          type: 'offer',
+          room: joinedRoom,
+          payload,
+        };
 
-      r.offerer = ws;
-      r.offer = {
-        type: 'offer',
-        room: joinedRoom,
-        payload,
-      };
-
-      // Reset any stale answer
-      r.answer = null;
-      r.answerer = null;
-
-      for (const peer of r.peers) {
-        if (peer !== ws) send(peer, r.offer);
+        broadcast(joinedRoom, ws, r.offer);
       }
       return;
     }
 
     /* ───────── ANSWER ───────── */
     if (type === 'answer') {
-      if (!r.offer || ws === r.offerer) return;
+      if (!r.answer) {
+        r.answer = {
+          type: 'answer',
+          room: joinedRoom,
+          payload,
+        };
 
-      r.answerer = ws;
-      r.answer = {
-        type: 'answer',
-        room: joinedRoom,
-        payload,
-      };
-
-      send(r.offerer, r.answer);
-
-      // Moment becomes alive ONLY here
-      send(r.offerer, { type: 'moment-ready', room: joinedRoom, payload: {} });
-      send(r.answerer, { type: 'moment-ready', room: joinedRoom, payload: {} });
+        broadcast(joinedRoom, ws, r.answer);
+        maybeReady(joinedRoom);
+      }
       return;
     }
 
     /* ───────── ICE ───────── */
     if (type === 'candidate') {
-      for (const peer of r.peers) {
-        if (peer !== ws) {
-          send(peer, {
-            type: 'candidate',
-            room: joinedRoom,
-            payload,
-          });
-        }
-      }
+      broadcast(joinedRoom, ws, {
+        type: 'candidate',
+        room: joinedRoom,
+        payload,
+      });
     }
   });
 
   ws.on('close', () => {
     if (!joinedRoom) return;
-    collapseRoom(joinedRoom);
+    const r = rooms.get(joinedRoom);
+    if (!r) return;
+
+    r.peers.delete(ws);
+
+    if (r.peers.size === 0) {
+      rooms.delete(joinedRoom);
+    }
   });
 });
 
-/* ─────────────────────────────────────────────
-   START
-   ───────────────────────────────────────────── */
-
 server.listen(PORT, () => {
-  console.log(`Hi Presence strict 2-party signaling on ${PORT}`);
+  console.log(`Hi Presence rendezvous signaling on ${PORT}`);
 });
