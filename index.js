@@ -1,209 +1,116 @@
 import express from 'express';
 import http from 'http';
-import cors from 'cors';
 import { WebSocketServer } from 'ws';
+import cors from 'cors';
 
-/* ─────────────────────────────────────────────
-   BOOTSTRAP
-   ───────────────────────────────────────────── */
-
-const PORT = Number(process.env.PORT);
-if (!PORT) {
-  throw new Error('PORT not provided by Render');
-}
+const PORT = process.env.PORT || 3000;
 
 const app = express();
 app.use(cors());
 
-// Optional but useful for liveness checks
+// ✅ REQUIRED FOR RENDER
 app.get('/', (_, res) => {
-  res.status(200).send('OK');
+  res.status(200).send('Hi Presence signaling server alive');
 });
 
 const server = http.createServer(app);
 
-/* ─────────────────────────────────────────────
-   WEBSOCKET SERVER (EXPLICIT UPGRADE)
-   ───────────────────────────────────────────── */
+// ✅ EXPLICIT WS SERVER
+const wss = new WebSocketServer({ server });
 
-const wss = new WebSocketServer({ noServer: true });
-
-server.on('upgrade', (request, socket, head) => {
-  wss.handleUpgrade(request, socket, head, (ws) => {
-    wss.emit('connection', ws, request);
-  });
-});
-
-/**
- * rooms: Map<roomId, {
- *   peers: Map<WebSocket, { role: 'offerer' | 'answerer' | null }>,
- *   quorum: number,
- *   lastOffer: object | null,
- *   lastAnswer: object | null
- * }>
- */
+/*
+rooms: Map<roomId, {
+  peers: Set<WebSocket>,
+  quorum: number
+}>
+*/
 const rooms = new Map();
 
-/* ─────────────────────────────────────────────
-   UTILITIES
-   ───────────────────────────────────────────── */
-
-const send = (ws, obj) => {
+function send(ws, msg) {
   if (ws.readyState === ws.OPEN) {
-    ws.send(JSON.stringify(obj));
+    ws.send(JSON.stringify(msg));
   }
-};
+}
 
-const broadcastExceptSender = (roomId, sender, obj) => {
+function broadcast(roomId, except, msg) {
   const room = rooms.get(roomId);
   if (!room) return;
 
-  for (const peer of room.peers.keys()) {
-    if (peer !== sender && peer.readyState === peer.OPEN) {
-      send(peer, obj);
+  for (const peer of room.peers) {
+    if (peer !== except) {
+      send(peer, msg);
     }
   }
-};
-
-const maybeEmitMomentReady = (roomId) => {
-  const room = rooms.get(roomId);
-  if (!room) return;
-
-  const ready =
-    room.peers.size >= room.quorum &&
-    room.lastOffer !== null &&
-    room.lastAnswer !== null;
-
-  if (!ready) return;
-
-  for (const peer of room.peers.keys()) {
-    send(peer, {
-      type: 'moment-ready',
-      room: roomId,
-      payload: {},
-    });
-  }
-};
-
-/* ─────────────────────────────────────────────
-   WEBSOCKET HANDLING
-   ───────────────────────────────────────────── */
+}
 
 wss.on('connection', (ws) => {
-  let roomId = null;
+  console.log('WS CONNECTED');
+
+  let joinedRoom = null;
 
   ws.on('message', (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw.toString());
     } catch {
+      console.log('INVALID JSON');
       return;
     }
 
-    const { type, payload } = msg;
-    roomId = msg.room ?? roomId;
-    if (!roomId || !type) return;
+    const { type, room, payload } = msg;
 
-    /* ───────── JOIN ───────── */
     if (type === 'join') {
-      const quorum = payload?.quorum ?? 2;
+      console.log('JOIN RECEIVED', room);
 
-      if (!rooms.has(roomId)) {
-        rooms.set(roomId, {
-          peers: new Map(),
-          quorum,
-          lastOffer: null,
-          lastAnswer: null,
+      if (!rooms.has(room)) {
+        rooms.set(room, {
+          peers: new Set(),
+          quorum: payload?.quorum ?? 2,
         });
       }
 
-      const room = rooms.get(roomId);
-      room.peers.set(ws, { role: null });
+      const r = rooms.get(room);
+      r.peers.add(ws);
+      joinedRoom = room;
 
-      // notify others only (never self)
-      broadcastExceptSender(roomId, ws, {
+      // ACK SELF
+      send(ws, {
         type: 'peer-present',
-        room: roomId,
+        room,
         payload: {},
       });
 
-      // replay SDP if present
-      if (room.lastOffer) send(ws, room.lastOffer);
-      if (room.lastAnswer) send(ws, room.lastAnswer);
-
-      maybeEmitMomentReady(roomId);
-      return;
-    }
-
-    /* ───────── OFFER ───────── */
-    if (type === 'offer') {
-      const room = rooms.get(roomId);
-      if (!room || room.lastOffer) return;
-
-      room.lastOffer = {
-        type: 'offer',
-        room: roomId,
-        payload: { sdp: payload.sdp },
-      };
-
-      room.peers.get(ws).role = 'offerer';
-      broadcastExceptSender(roomId, ws, room.lastOffer);
-      maybeEmitMomentReady(roomId);
-      return;
-    }
-
-    /* ───────── ANSWER ───────── */
-    if (type === 'answer') {
-      const room = rooms.get(roomId);
-      if (!room || !room.lastOffer || room.lastAnswer) return;
-
-      room.lastAnswer = {
-        type: 'answer',
-        room: roomId,
-        payload: { sdp: payload.sdp },
-      };
-
-      room.peers.get(ws).role = 'answerer';
-      broadcastExceptSender(roomId, ws, room.lastAnswer);
-      maybeEmitMomentReady(roomId);
-      return;
-    }
-
-    /* ───────── ICE (UNCONDITIONAL RELAY) ───────── */
-    if (type === 'candidate') {
-      const room = rooms.get(roomId);
-      if (!room) return;
-
-      broadcastExceptSender(roomId, ws, {
-        type: 'candidate',
-        room: roomId,
-        payload,
+      // NOTIFY OTHERS
+      broadcast(room, ws, {
+        type: 'peer-present',
+        room,
+        payload: {},
       });
+
+      return;
+    }
+
+    // RELAY EVERYTHING ELSE
+    if (joinedRoom) {
+      broadcast(joinedRoom, ws, msg);
     }
   });
 
   ws.on('close', () => {
-    if (!roomId || !rooms.has(roomId)) return;
+    console.log('WS CLOSED');
 
-    const room = rooms.get(roomId);
-    room.peers.delete(ws);
+    if (!joinedRoom) return;
 
-    broadcastExceptSender(roomId, ws, {
-      type: 'peer-left',
-      room: roomId,
-      payload: {},
-    });
+    const r = rooms.get(joinedRoom);
+    if (!r) return;
 
-    if (room.peers.size === 0) {
-      rooms.delete(roomId);
+    r.peers.delete(ws);
+    if (r.peers.size === 0) {
+      rooms.delete(joinedRoom);
     }
   });
 });
 
-/* ─────────────────────────────────────────────
-   START SERVER
-   ───────────────────────────────────────────── */
-
 server.listen(PORT, () => {
-  console.log(`Signaling server running on ${PORT}`);
+  console.log(`SIGNALING SERVER RUNNING ON ${PORT}`);
 });
