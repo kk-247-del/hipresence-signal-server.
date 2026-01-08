@@ -13,10 +13,9 @@ const wss = new WebSocketServer({ server });
 
 /*
 rooms: Map<roomId, {
-  peers: Set<WebSocket>,
+  peers: Map<WebSocket, senderId>,
   offer: object | null,
-  answer: object | null,
-  readyPeers: Set<WebSocket>
+  answer: object | null
 }>
 */
 const rooms = new Map();
@@ -31,9 +30,9 @@ function broadcast(roomId, except, msg) {
   const room = rooms.get(roomId);
   if (!room) return;
 
-  for (const peer of room.peers) {
-    if (peer !== except && peer.readyState === peer.OPEN) {
-      send(peer, msg);
+  for (const ws of room.peers.keys()) {
+    if (ws !== except && ws.readyState === ws.OPEN) {
+      send(ws, msg);
     }
   }
 }
@@ -42,15 +41,9 @@ function maybeReady(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
 
-  // 🔒 HARD RULE: everyone must be transport-ready
-  if (
-    room.offer &&
-    room.answer &&
-    room.readyPeers.size === room.peers.size &&
-    room.peers.size > 0
-  ) {
-    for (const peer of room.peers) {
-      send(peer, {
+  if (room.offer && room.answer) {
+    for (const ws of room.peers.keys()) {
+      send(ws, {
         type: 'moment-ready',
         room: roomId,
         payload: {},
@@ -70,7 +63,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    const { type, room, payload } = msg;
+    const { type, room, payload, sender } = msg;
     if (!type || !room) return;
 
     /* ───────── JOIN ───────── */
@@ -79,34 +72,41 @@ wss.on('connection', (ws) => {
 
       if (!rooms.has(room)) {
         rooms.set(room, {
-          peers: new Set(),
+          peers: new Map(),
           offer: null,
           answer: null,
-          readyPeers: new Set(),
         });
       }
 
       const r = rooms.get(room);
-      r.peers.add(ws);
+      r.peers.set(ws, sender);
 
-      // presence update
-      for (const peer of r.peers) {
-        send(peer, {
+      const peers = Array.from(r.peers.values());
+      const offererId = peers[0]; // FIRST JOINER IS OFFERER
+
+      // Notify presence WITH offererId
+      for (const [peerWs] of r.peers) {
+        send(peerWs, {
           type: 'peer-present',
           room,
-          payload: { count: r.peers.size },
+          payload: {
+            count: r.peers.size,
+            offererId,
+          },
         });
       }
 
-      // replay signaling if late join
+      // Replay offer/answer if late join
       if (r.offer) send(ws, r.offer);
       if (r.answer) send(ws, r.answer);
 
+      maybeReady(room);
       return;
     }
 
     if (!joinedRoom) return;
     const r = rooms.get(joinedRoom);
+    if (!r) return;
 
     /* ───────── OFFER ───────── */
     if (type === 'offer') {
@@ -130,6 +130,7 @@ wss.on('connection', (ws) => {
           payload,
         };
         broadcast(joinedRoom, ws, r.answer);
+        maybeReady(joinedRoom);
       }
       return;
     }
@@ -141,14 +142,6 @@ wss.on('connection', (ws) => {
         room: joinedRoom,
         payload,
       });
-      return;
-    }
-
-    /* ───────── TRANSPORT READY ───────── */
-    if (type === 'transport-ready') {
-      r.readyPeers.add(ws);
-      maybeReady(joinedRoom);
-      return;
     }
   });
 
@@ -158,8 +151,6 @@ wss.on('connection', (ws) => {
     if (!r) return;
 
     r.peers.delete(ws);
-    r.readyPeers.delete(ws);
-
     if (r.peers.size === 0) {
       rooms.delete(joinedRoom);
     }
@@ -167,5 +158,5 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Hi Presence rendezvous signaling on ${PORT}`);
+  console.log(`Hi Presence signaling on ${PORT}`);
 });
