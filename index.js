@@ -15,7 +15,8 @@ const wss = new WebSocketServer({ server });
 rooms: Map<roomId, {
   peers: Set<WebSocket>,
   offer: object | null,
-  answer: object | null
+  answer: object | null,
+  readyPeers: Set<WebSocket>
 }>
 */
 const rooms = new Map();
@@ -41,7 +42,13 @@ function maybeReady(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
 
-  if (room.offer && room.answer) {
+  // 🔒 HARD RULE: everyone must be transport-ready
+  if (
+    room.offer &&
+    room.answer &&
+    room.readyPeers.size === room.peers.size &&
+    room.peers.size > 0
+  ) {
     for (const peer of room.peers) {
       send(peer, {
         type: 'moment-ready',
@@ -75,13 +82,14 @@ wss.on('connection', (ws) => {
           peers: new Set(),
           offer: null,
           answer: null,
+          readyPeers: new Set(),
         });
       }
 
       const r = rooms.get(room);
       r.peers.add(ws);
 
-      // notify presence
+      // presence update
       for (const peer of r.peers) {
         send(peer, {
           type: 'peer-present',
@@ -90,11 +98,10 @@ wss.on('connection', (ws) => {
         });
       }
 
-      // 🔑 CRITICAL FIX: replay offer if it exists
+      // replay signaling if late join
       if (r.offer) send(ws, r.offer);
       if (r.answer) send(ws, r.answer);
 
-      maybeReady(room);
       return;
     }
 
@@ -109,7 +116,6 @@ wss.on('connection', (ws) => {
           room: joinedRoom,
           payload,
         };
-
         broadcast(joinedRoom, ws, r.offer);
       }
       return;
@@ -123,9 +129,7 @@ wss.on('connection', (ws) => {
           room: joinedRoom,
           payload,
         };
-
         broadcast(joinedRoom, ws, r.answer);
-        maybeReady(joinedRoom);
       }
       return;
     }
@@ -137,6 +141,14 @@ wss.on('connection', (ws) => {
         room: joinedRoom,
         payload,
       });
+      return;
+    }
+
+    /* ───────── TRANSPORT READY ───────── */
+    if (type === 'transport-ready') {
+      r.readyPeers.add(ws);
+      maybeReady(joinedRoom);
+      return;
     }
   });
 
@@ -146,6 +158,7 @@ wss.on('connection', (ws) => {
     if (!r) return;
 
     r.peers.delete(ws);
+    r.readyPeers.delete(ws);
 
     if (r.peers.size === 0) {
       rooms.delete(joinedRoom);
